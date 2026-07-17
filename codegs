@@ -1,0 +1,402 @@
+/**
+ * Sheet Invoice Generator (Google Apps Script)
+ * 100% AI-generated, 100% human-directed.
+ * Directed and iterated by Yordhan Fitrians Akhmad B. based on real HR pain points —
+ * refined repeatedly for business fit, user experience, and workflow comfort.
+ * Published as a generic, reusable template. Configure everything via the ⚙️ Setup menu.
+ */
+
+/**
+ * WHAT IT DOES
+ *  1. Tick the "Create Invoice?" checkbox on a tracker row.
+ *  2. Menu: Invoice Tools > Generate Invoices (checked rows)
+ *  3. For each checked row the script:
+ *       - builds a formatted invoice as a Google Doc,
+ *       - exports it as a PDF into a Drive folder,
+ *       - writes back: Invoice Number, Date Created, Date Deadline, Invoice Link.
+ *  4. Rows that already have an Invoice Link are skipped (no duplicates).
+ *
+ * CONFIGURATION
+ *  - No IDs, names, or organization-specific values are hardcoded.
+ *  - All settings live in Script Properties, entered once via the ⚙️ Setup menu.
+ *  - Columns are resolved by HEADER NAME (see COLUMNS below), so column order
+ *    in the sheet does not matter. Rename the headers here if yours differ.
+ */
+
+// ===================== COLUMN HEADERS (row 1 of your sheet) =====================
+// Generic template headers. Adjust to match your own sheet, or rename your sheet
+// headers to match these.
+const COLUMNS = {
+  REFERENCE: 'Reference',                 // free-text reference / batch label
+  ITEM1:     'Receipt 1',                 // amount of receipt/expense #1
+  ITEM2:     'Receipt 2',
+  ITEM3:     'Receipt 3',
+  TOTAL:     'Total',
+  SUBJECT:   'Subject',
+  NOTES:     'Notes',                     // optional "Receipt 1 = description" lines
+  TERMS:     'Payment Terms',             // e.g. "30 Days" -> due date = created + 30
+  CREATE:    'Create Invoice?',           // checkbox column
+  SIGNER:    'Signed by',                 // full name for the digital signature block
+  SIGNER_ID: 'Employee ID',               // optional ID shown under the signature
+  CREATED:   'Invoice Date Created',
+  DEADLINE:  'Invoice Date Deadline',
+  LINK:      'Invoice Link',
+  INVNO:     'Invoice Number',
+};
+
+// ===================== CONFIG LAYER (Script Properties) =====================
+// Defaults are generic placeholders. Real values are entered through the
+// ⚙️ Setup menu and stored with PropertiesService — never in the code.
+const CONFIG_DEFAULTS = {
+  SHEET_NAME:         'Sheet1',
+  COMPANY_NAME:       'Company Name',
+  DEPT_FROM:          'Requesting Department',
+  BILL_TO:            'Billing Department',
+  INV_PREFIX:         'INV',              // becomes INV/2026/07/001
+  OUTPUT_FOLDER_ID:   '',                 // optional Drive folder ID for PDFs
+  OUTPUT_FOLDER_NAME: 'Generated Invoices', // used if no folder ID is set
+  KEEP_GDOC:          'false',            // 'true' keeps the Doc next to the PDF
+  DEFAULT_TERM_DAYS:  '30',
+  TIMEZONE:           '',                 // blank = script timezone
+  SIGN_FONT:          'Dancing Script',   // cursive font for the signature line
+  SIGN_FONT_SIZE:     '24',
+  AMOUNT_IN_WORDS:    'off',              // 'off' | 'id' (example implementation)
+};
+
+function getConfig_() {
+  const stored = PropertiesService.getScriptProperties().getProperties();
+  const cfg = {};
+  Object.keys(CONFIG_DEFAULTS).forEach(k => {
+    cfg[k] = (k in stored && stored[k] !== '') ? stored[k] : CONFIG_DEFAULTS[k];
+  });
+  cfg.TIMEZONE = cfg.TIMEZONE || Session.getScriptTimeZone();
+  return cfg;
+}
+
+function saveConfig_(partial) {
+  const clean = {};
+  Object.keys(partial).forEach(k => {
+    if (k in CONFIG_DEFAULTS) clean[k] = String(partial[k]);
+  });
+  PropertiesService.getScriptProperties().setProperties(clean);
+}
+
+// ===================== MENUS =====================
+
+function onOpen() {
+  const ui = SpreadsheetApp.getUi();
+  ui.createMenu('Invoice Tools')
+    .addItem('Generate Invoices (checked rows)', 'generateInvoices')
+    .addToUi();
+  ui.createMenu('⚙️ Setup')
+    .addItem('Run setup wizard', 'runSetupWizard')
+    .addItem('View current config', 'viewConfig')
+    .addItem('Reset config to defaults', 'resetConfig')
+    .addToUi();
+}
+
+/** Prompts for every setting once; blank answer keeps the current value. */
+function runSetupWizard() {
+  const ui = SpreadsheetApp.getUi();
+  const cfg = getConfig_();
+  const ask = (label, key) => {
+    const res = ui.prompt('⚙️ Setup', label + '\n\nCurrent: ' + (cfg[key] || '(empty)') +
+      '\nLeave blank to keep.', ui.ButtonSet.OK_CANCEL);
+    if (res.getSelectedButton() !== ui.Button.OK) throw new Error('Setup cancelled.');
+    const v = res.getResponseText().trim();
+    if (v !== '') cfg[key] = v;
+  };
+
+  ask('Sheet (tab) name of the tracker:', 'SHEET_NAME');
+  ask('Company / organization name (shown on the invoice):', 'COMPANY_NAME');
+  ask('Issuing department (From):', 'DEPT_FROM');
+  ask('Bill To (recipient department or entity):', 'BILL_TO');
+  ask('Invoice number prefix (e.g. INV or INV/DEPT):', 'INV_PREFIX');
+  ask('Drive folder ID for generated PDFs (blank = auto-create by name):', 'OUTPUT_FOLDER_ID');
+  ask('Drive folder NAME (used only when no folder ID is set):', 'OUTPUT_FOLDER_NAME');
+  ask('Keep the intermediate Google Doc? (true/false):', 'KEEP_GDOC');
+  ask('Default payment term in days (when the Terms cell is empty):', 'DEFAULT_TERM_DAYS');
+  ask('Timezone (e.g. America/New_York; blank = script timezone):', 'TIMEZONE');
+  ask('Signature font (e.g. Dancing Script, Caveat, Great Vibes):', 'SIGN_FONT');
+  ask('Signature font size:', 'SIGN_FONT_SIZE');
+  ask("Amount-in-words line: 'off' or 'id' (Indonesian example):", 'AMOUNT_IN_WORDS');
+
+  saveConfig_(cfg);
+  ui.alert('Setup saved. You can re-run the wizard anytime from ⚙️ Setup.');
+}
+
+function viewConfig() {
+  const cfg = getConfig_();
+  const lines = Object.keys(cfg).map(k => k + ' = ' + cfg[k]);
+  SpreadsheetApp.getUi().alert('Current configuration:\n\n' + lines.join('\n'));
+}
+
+function resetConfig() {
+  const ui = SpreadsheetApp.getUi();
+  const res = ui.alert('Reset all settings to defaults?', ui.ButtonSet.YES_NO);
+  if (res !== ui.Button.YES) return;
+  PropertiesService.getScriptProperties().deleteAllProperties();
+  ui.alert('Config reset. Run the setup wizard to configure again.');
+}
+
+// ===================== MAIN =====================
+
+function generateInvoices() {
+  const cfg = getConfig_();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sh = ss.getSheetByName(cfg.SHEET_NAME);
+  if (!sh) throw new Error('Sheet not found: ' + cfg.SHEET_NAME +
+    ' — set the correct tab name via ⚙️ Setup.');
+
+  const HEADER_ROW = 1;
+  const headers = sh.getRange(HEADER_ROW, 1, 1, sh.getLastColumn()).getValues()[0]
+    .map(h => String(h).trim());
+  const idx = {};
+  Object.entries(COLUMNS).forEach(([key, name]) => {
+    const i = headers.indexOf(name);
+    if (i === -1) throw new Error('Header not found in row 1: "' + name + '"');
+    idx[key] = i; // 0-based
+  });
+
+  const lastRow = sh.getLastRow();
+  if (lastRow <= HEADER_ROW) return;
+
+  const dataRange = sh.getRange(HEADER_ROW + 1, 1, lastRow - HEADER_ROW, sh.getLastColumn());
+  const data = dataRange.getValues();
+  // Display values: used for the ID field so long numeric IDs keep every digit
+  // (plain getValues() loses precision past 15 digits).
+  const disp = dataRange.getDisplayValues();
+  const folder = getOutputFolder_(cfg);
+  let made = 0, skipped = 0;
+
+  data.forEach((row, i) => {
+    const rowNum = HEADER_ROW + 1 + i;
+    const wantsInvoice = row[idx.CREATE] === true; // checkbox
+    const hasLink = String(row[idx.LINK]).trim() !== '';
+    if (!wantsInvoice) return;
+    if (hasLink) { skipped++; return; }
+
+    const now = new Date();
+    const termDays = parseTermDays_(row[idx.TERMS], cfg);
+    const deadline = new Date(now.getTime() + termDays * 24 * 60 * 60 * 1000);
+    const invNo = nextInvoiceNumber_(now, cfg);
+
+    const items = [
+      { label: 'Receipt 1', amount: toNumber_(row[idx.ITEM1]) },
+      { label: 'Receipt 2', amount: toNumber_(row[idx.ITEM2]) },
+      { label: 'Receipt 3', amount: toNumber_(row[idx.ITEM3]) },
+    ].filter(n => n.amount > 0);
+
+    // Optional line-item descriptions parsed from the Notes column.
+    // DEMONSTRATION SCHEMA — this expects lines like "Receipt 1 = description".
+    // Adapt parseNotesDescriptions_() to whatever convention your team uses.
+    const noteMap = parseNotesDescriptions_(String(row[idx.NOTES] || ''));
+    items.forEach(n => { n.desc = noteMap[n.label] || n.label; });
+
+    const total = toNumber_(row[idx.TOTAL]) ||
+      items.reduce((s, n) => s + n.amount, 0);
+
+    const pdfUrl = buildInvoicePdf_({
+      invNo: invNo,
+      dateCreated: now,
+      deadline: deadline,
+      termDays: termDays,
+      reference: String(row[idx.REFERENCE] || ''),
+      subject: String(row[idx.SUBJECT] || ''),
+      items: items,
+      total: total,
+      signer: String(row[idx.SIGNER] || '').trim(),
+      signerId: String(disp[i][idx.SIGNER_ID] || '').trim(),
+    }, folder, cfg);
+
+    sh.getRange(rowNum, idx.CREATED + 1).setValue(now);
+    sh.getRange(rowNum, idx.DEADLINE + 1).setValue(deadline);
+    sh.getRange(rowNum, idx.LINK + 1).setValue(pdfUrl);
+    sh.getRange(rowNum, idx.INVNO + 1).setValue(invNo);
+    made++;
+  });
+
+  SpreadsheetApp.getUi().alert(
+    'Invoice generation done.\nCreated: ' + made +
+    '\nSkipped (already has link): ' + skipped
+  );
+}
+
+// ===================== DOCUMENT BUILDER =====================
+
+function buildInvoicePdf_(inv, folder, cfg) {
+  const fmtDate = d => Utilities.formatDate(d, cfg.TIMEZONE, 'dd MMMM yyyy');
+  const docName = 'Invoice ' + inv.invNo.replace(/\//g, '-') + ' - ' +
+    (inv.subject || inv.reference).slice(0, 60);
+
+  const doc = DocumentApp.create(docName);
+  const body = doc.getBody();
+  body.setMarginTop(50).setMarginBottom(50).setMarginLeft(55).setMarginRight(55);
+
+  // Header
+  const h = body.appendParagraph(cfg.COMPANY_NAME);
+  h.setHeading(DocumentApp.ParagraphHeading.HEADING1);
+  h.editAsText().setFontSize(16).setBold(true);
+  body.appendParagraph(cfg.DEPT_FROM).editAsText().setFontSize(10).setItalic(true);
+  body.appendParagraph('INTERNAL INVOICE')
+    .editAsText().setFontSize(13).setBold(true);
+  body.appendHorizontalRule();
+
+  // Meta table
+  const meta = body.appendTable([
+    ['Invoice No.',  inv.invNo],
+    ['Invoice Date', fmtDate(inv.dateCreated)],
+    ['Payment Due',  fmtDate(inv.deadline) + '  (terms: ' + inv.termDays + ' days)'],
+    ['Bill To',      cfg.BILL_TO],
+    ['Subject',      inv.subject],
+    ['Reference',    inv.reference],
+  ]);
+  meta.setBorderWidth(0);
+  for (let r = 0; r < meta.getNumRows(); r++) {
+    meta.getRow(r).getCell(0).editAsText().setBold(true).setFontSize(10);
+    meta.getRow(r).getCell(1).editAsText().setBold(false).setFontSize(10);
+    meta.getRow(r).getCell(0).setWidth(120);
+  }
+
+  body.appendParagraph(''); // spacer
+
+  // Line items
+  const rows = [['No.', 'Description', 'Amount']];
+  inv.items.forEach((n, i) => rows.push([String(i + 1), n.desc, formatAmount_(n.amount)]));
+  rows.push(['', 'TOTAL', formatAmount_(inv.total)]);
+
+  const t = body.appendTable(rows);
+  t.getRow(0).editAsText().setBold(true);
+  t.getRow(t.getNumRows() - 1).editAsText().setBold(true);
+  for (let r = 0; r < t.getNumRows(); r++) {
+    t.getRow(r).getCell(0).setWidth(35);
+    t.getRow(r).getCell(2).setWidth(110);
+    t.getRow(r).getCell(2).getChild(0).asParagraph()
+      .setAlignment(DocumentApp.HorizontalAlignment.RIGHT);
+  }
+
+  // Optional amount-in-words line (Indonesian example implementation)
+  if (cfg.AMOUNT_IN_WORDS === 'id') {
+    body.appendParagraph('Terbilang: ' + amountInWordsId_(inv.total) + ' rupiah')
+      .editAsText().setItalic(true).setFontSize(10);
+  }
+
+  body.appendParagraph('');
+  body.appendParagraph('Prepared and digitally signed by,').editAsText().setFontSize(10);
+  body.appendParagraph('');
+
+  // Signature line — signer name in a cursive font, mimicking a hand signature
+  const sig = body.appendParagraph(inv.signer || cfg.DEPT_FROM);
+  sig.editAsText()
+    .setFontFamily(cfg.SIGN_FONT)
+    .setFontSize(Number(cfg.SIGN_FONT_SIZE) || 24)
+    .setBold(false)
+    .setItalic(true);
+
+  // Name in a normal font, as usually printed under a signature
+  body.appendParagraph(inv.signer || cfg.DEPT_FROM)
+    .editAsText().setFontFamily('Arial').setFontSize(10).setBold(true).setItalic(false);
+
+  if (inv.signerId) {
+    body.appendParagraph('ID: ' + inv.signerId)
+      .editAsText().setFontFamily('Arial').setFontSize(10).setItalic(false).setBold(false);
+  }
+  body.appendParagraph(cfg.DEPT_FROM + ' — ' + cfg.COMPANY_NAME)
+    .editAsText().setFontFamily('Arial').setFontSize(9).setItalic(true).setBold(false);
+
+  doc.saveAndClose();
+
+  // Export PDF into the output folder
+  const docFile = DriveApp.getFileById(doc.getId());
+  const pdfBlob = docFile.getAs('application/pdf').setName(docName + '.pdf');
+  const pdfFile = folder.createFile(pdfBlob);
+
+  if (cfg.KEEP_GDOC === 'true') {
+    docFile.moveTo(folder);
+  } else {
+    docFile.setTrashed(true);
+  }
+  return pdfFile.getUrl();
+}
+
+// ===================== HELPERS =====================
+
+function getOutputFolder_(cfg) {
+  if (cfg.OUTPUT_FOLDER_ID) return DriveApp.getFolderById(cfg.OUTPUT_FOLDER_ID);
+  const it = DriveApp.getFoldersByName(cfg.OUTPUT_FOLDER_NAME);
+  return it.hasNext() ? it.next() : DriveApp.createFolder(cfg.OUTPUT_FOLDER_NAME);
+}
+
+/** Sequential monthly counter in Script Properties: PREFIX/YYYY/MM/001 */
+function nextInvoiceNumber_(date, cfg) {
+  const ym = Utilities.formatDate(date, cfg.TIMEZONE, 'yyyy/MM');
+  const key = 'INV_SEQ_' + ym.replace('/', '');
+  const props = PropertiesService.getScriptProperties();
+  const lock = LockService.getScriptLock();
+  lock.waitLock(5000);
+  try {
+    const n = Number(props.getProperty(key) || 0) + 1;
+    props.setProperty(key, String(n));
+    return cfg.INV_PREFIX + '/' + ym + '/' + ('000' + n).slice(-3);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** "30 Days" / "30" / 30 -> 30 */
+function parseTermDays_(v, cfg) {
+  const m = String(v || '').match(/\d+/);
+  return m ? Number(m[0]) : (Number(cfg.DEFAULT_TERM_DAYS) || 30);
+}
+
+/**
+ * DEMONSTRATION SCHEMA — parses optional "Receipt 1 = description" lines from
+ * the Notes column into line-item descriptions. This convention is an example,
+ * not a production spec; adapt the regex/labels to your own data.
+ */
+function parseNotesDescriptions_(notes) {
+  const map = {};
+  notes.split(/\r?\n/).forEach(line => {
+    const m = line.match(/^\s*(Receipt\s*\d+)\s*[=:\-]\s*(.+)$/i);
+    if (m) map[normalizeLabel_(m[1])] = m[2].trim();
+  });
+  return map;
+}
+function normalizeLabel_(s) {
+  const n = s.match(/\d+/);
+  return 'Receipt ' + (n ? n[0] : '');
+}
+
+function toNumber_(v) {
+  if (typeof v === 'number') return v;
+  const n = Number(String(v || '').replace(/[^\d.-]/g, ''));
+  return isNaN(n) ? 0 : n;
+}
+
+/** 400000 -> "400.000" (dot thousands separator; adjust to your locale) */
+function formatAmount_(n) {
+  return Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+}
+
+/**
+ * EXAMPLE implementation: Indonesian number-to-words for the optional
+ * amount-in-words line. Replace with your own locale, or leave
+ * AMOUNT_IN_WORDS = 'off' to skip it entirely.
+ */
+function amountInWordsId_(n) {
+  n = Math.round(Math.abs(n));
+  if (n === 0) return 'nol';
+  const units = ['', 'satu', 'dua', 'tiga', 'empat', 'lima', 'enam', 'tujuh', 'delapan', 'sembilan', 'sepuluh', 'sebelas'];
+  function words(x) {
+    if (x < 12) return units[x];
+    if (x < 20) return words(x - 10) + ' belas';
+    if (x < 100) return words(Math.floor(x / 10)) + ' puluh' + (x % 10 ? ' ' + words(x % 10) : '');
+    if (x < 200) return 'seratus' + (x % 100 ? ' ' + words(x % 100) : '');
+    if (x < 1000) return words(Math.floor(x / 100)) + ' ratus' + (x % 100 ? ' ' + words(x % 100) : '');
+    if (x < 2000) return 'seribu' + (x % 1000 ? ' ' + words(x % 1000) : '');
+    if (x < 1e6) return words(Math.floor(x / 1000)) + ' ribu' + (x % 1000 ? ' ' + words(x % 1000) : '');
+    if (x < 1e9) return words(Math.floor(x / 1e6)) + ' juta' + (x % 1e6 ? ' ' + words(x % 1e6) : '');
+    return words(Math.floor(x / 1e9)) + ' miliar' + (x % 1e9 ? ' ' + words(x % 1e9) : '');
+  }
+  return words(n).replace(/\s+/g, ' ').trim();
+}
